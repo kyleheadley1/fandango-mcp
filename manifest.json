@@ -1,0 +1,43 @@
+{
+  "manifest_version": "0.3",
+  "name": "fandango-mcp",
+  "display_name": "Fandango Availability MCP",
+  "version": "0.1.0",
+  "description": "Read-only MCP server for Fandango movie showtimes and seat availability.",
+  "long_description": "Local, read-only MCP server for Fandango built from observed web traffic. It searches movie showtimes across nearby theaters, reads theater calendars and theater-specific showtimes, fetches seat availability by showtimeHashCode, and renders terminal-friendly seat maps. It never buys, reserves, holds, validates, favorites, or checks out tickets.",
+  "author": {
+    "name": "Andrew Finke"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "FANDANGO_USER_AGENT": "${user_config.user_agent}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "fandango_movie_showtimes", "description": "Find one movie's showtimes across nearby theaters for one date." },
+    { "name": "fandango_theater_showtimes", "description": "Find one theater's movie showtimes for one date." },
+    { "name": "fandango_theater_calendar", "description": "Read which dates currently have showtimes for one theater." },
+    { "name": "fandango_seat_availability", "description": "Read normalized open/taken seat availability for one showtimeHashCode." },
+    { "name": "fandango_scan_movie_availability", "description": "Scan one movie across nearby theaters and dates, optionally with seat counts." },
+    { "name": "fandango_render_seat_map", "description": "Render a showtime seat map as terminal-friendly Unicode boxes." }
+  ],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=20.18.0" }
+  },
+  "user_config": {
+    "user_agent": {
+      "type": "string",
+      "title": "User-Agent",
+      "description": "Optional browser User-Agent override matching captured Fandango traffic.",
+      "required": false
+    }
+  }
+}
