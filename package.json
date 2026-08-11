@@ -19,10 +19,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
     "dotenv": "17.3.1",
+    "nodemailer": "^9.0.5",
     "zod": "4.3.6"
   },
   "devDependencies": {
     "@types/node": "25.5.0",
+    "@types/nodemailer": "^8.0.1",
     "tsx": "^4.23.0",
     "typescript": "6.0.2"
   }
