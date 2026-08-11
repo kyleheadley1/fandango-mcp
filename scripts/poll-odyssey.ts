@@ -1,4 +1,5 @@
-import { execSync } from "node:child_process";
+import "dotenv/config";
+
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createTransport } from "nodemailer";
 
@@ -10,6 +11,18 @@ import type {
   OpenSeatGroup,
 } from "../src/fandango/types.js";
 import { summarizeOpenSeatGroups } from "../src/fandango/types.js";
+
+/** Return a copy of the seat map with wheelchair seats excluded. */
+function excludeWheelchairSeats(seatMap: NormalizedSeatMap): NormalizedSeatMap {
+  const filtered = seatMap.seats.filter((s) => !s.isWheelchair);
+  return {
+    ...seatMap,
+    seats: filtered,
+    totalSeatCount: filtered.length,
+    availableSeatCount: filtered.filter((s) => s.isAvailable).length,
+    takenSeatCount: filtered.filter((s) => !s.isAvailable).length,
+  };
+}
 
 // ── Config ──────────────────────────────────────────────────────────────
 
@@ -116,7 +129,7 @@ function acceptableGroups(
   seatMap: NormalizedSeatMap,
   theater: TheaterConfig,
 ): TaggedGroup[] {
-  const allGroups = summarizeOpenSeatGroups(seatMap, 50);
+  const allGroups = summarizeOpenSeatGroups(excludeWheelchairSeats(seatMap), 50);
   const result: TaggedGroup[] = [];
   for (const g of allGroups) {
     if (!theater.acceptableRows.includes(g.row)) continue;
@@ -147,6 +160,44 @@ function loadState(): Set<string> {
 function saveState(state: Set<string>): void {
   mkdirSync("data", { recursive: true });
   writeFileSync(STATE_FILE, JSON.stringify([...state], null, 2));
+}
+
+const ALERTS_LOG = "data/seat-alerts.json";
+
+interface StoredAlert {
+  timestamp: string;
+  theaterName: string;
+  date: string;
+  displayTime: string;
+  tier: SeatTier;
+  seats: string;
+  purchaseUrl: string;
+}
+
+function appendAlertLog(alerts: Alert[]): void {
+  mkdirSync("data", { recursive: true });
+  let existing: StoredAlert[] = [];
+  try {
+    if (existsSync(ALERTS_LOG)) {
+      existing = JSON.parse(readFileSync(ALERTS_LOG, "utf-8")) as StoredAlert[];
+    }
+  } catch { /* start fresh */ }
+
+  const now = new Date().toISOString();
+  for (const a of alerts) {
+    for (const t of a.tagged) {
+      existing.push({
+        timestamp: now,
+        theaterName: a.theaterName,
+        date: a.date,
+        displayTime: a.displayTime,
+        tier: t.tier,
+        seats: t.group.label,
+        purchaseUrl: a.purchaseUrl,
+      });
+    }
+  }
+  writeFileSync(ALERTS_LOG, JSON.stringify(existing, null, 2));
 }
 
 // ── Notifications ───────────────────────────────────────────────────────
@@ -186,7 +237,10 @@ async function sendEmail(alerts: Alert[]): Promise<void> {
   const user = process.env.GMAIL_USER;
   const pass = process.env.GMAIL_APP_PASSWORD;
   const to = process.env.ALERT_EMAIL_TO;
-  if (!user || !pass || !to) return;
+  if (!user || !pass || !to) {
+    log("Email skipped — GMAIL_USER, GMAIL_APP_PASSWORD, or ALERT_EMAIL_TO not set");
+    return;
+  }
 
   const transporter = createTransport({
     service: "gmail",
@@ -203,29 +257,50 @@ async function sendEmail(alerts: Alert[]): Promise<void> {
   log("Email sent");
 }
 
-function sendIMessage(alerts: Alert[]): void {
-  const to = process.env.IMESSAGE_TO;
-  if (!to || process.platform !== "darwin") return;
-
-  const text = formatAlertText(alerts);
-  const escaped = text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  try {
-    execSync(
-      `osascript -e 'tell application "Messages" to send "${escaped}" to buddy "${to}"'`,
-      { timeout: 10_000 },
-    );
-    log("iMessage sent");
-  } catch (err) {
-    log(`iMessage failed: ${err instanceof Error ? err.message : String(err)}`);
+async function sendSms(alerts: Alert[], transporter: ReturnType<typeof createTransport>): Promise<void> {
+  const smsTo = process.env.SMS_TO;
+  const from = process.env.GMAIL_USER;
+  if (!smsTo || !from) {
+    log("SMS skipped — SMS_TO or GMAIL_USER not set");
+    return;
   }
+
+  for (const a of alerts) {
+    const tier = a.tagged[0]?.tier ?? "GOOD";
+    const text = `[${tier}] ${a.theaterName} ${a.displayTime} ${a.date}\n${a.purchaseUrl}`;
+    await transporter.sendMail({ from, to: smsTo, subject: "", text });
+  }
+  log(`SMS sent (${alerts.length} message${alerts.length > 1 ? "s" : ""})`);
 }
 
-async function notify(alerts: Alert[]): Promise<void> {
-  if (alerts.length === 0) return;
-  await sendEmail(alerts).catch((err: unknown) =>
-    log(`Email error: ${err instanceof Error ? err.message : String(err)}`),
-  );
-  sendIMessage(alerts);
+/** Returns true if at least one channel delivered successfully. */
+async function notify(alerts: Alert[]): Promise<boolean> {
+  if (alerts.length === 0) return true;
+  let delivered = false;
+
+  const user = process.env.GMAIL_USER;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  const transporter = user && pass
+    ? createTransport({ service: "gmail", auth: { user, pass } })
+    : null;
+
+  try {
+    await sendEmail(alerts);
+    delivered = true;
+  } catch (err) {
+    log(`Email error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (transporter) {
+    try {
+      await sendSms(alerts, transporter);
+      delivered = true;
+    } catch (err) {
+      log(`SMS error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  return delivered;
 }
 
 // ── Logging ─────────────────────────────────────────────────────────────
@@ -237,8 +312,14 @@ function log(msg: string): void {
 
 // ── Main polling cycle ──────────────────────────────────────────────────
 
-async function pollCycle(client: FandangoClient, state: Set<string>): Promise<Alert[]> {
+interface CycleResult {
+  alerts: Alert[];
+  pendingKeys: string[];
+}
+
+async function pollCycle(client: FandangoClient, state: Set<string>): Promise<CycleResult> {
   const alerts: Alert[] = [];
+  const pendingKeys: string[] = [];
 
   for (const theater of THEATERS) {
     for (const date of ELIGIBLE_DATES) {
@@ -275,9 +356,10 @@ async function pollCycle(client: FandangoClient, state: Set<string>): Promise<Al
               );
 
               if (newTagged.length > 0) {
-                for (const t of newTagged) {
-                  state.add(groupKey(theater.id, showtime.showtimeHashCode!, t.group));
-                }
+                const keys = newTagged.map((t) =>
+                  groupKey(theater.id, showtime.showtimeHashCode!, t.group),
+                );
+                pendingKeys.push(...keys);
                 alerts.push({
                   theaterName: theater.name,
                   date,
@@ -297,7 +379,7 @@ async function pollCycle(client: FandangoClient, state: Set<string>): Promise<Al
     }
   }
 
-  return alerts;
+  return { alerts, pendingKeys };
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────
@@ -321,11 +403,19 @@ async function main(): Promise<void> {
   while (running) {
     log("── cycle start ──");
     try {
-      const alerts = await pollCycle(client, state);
-      saveState(state);
+      const { alerts, pendingKeys } = await pollCycle(client, state);
       if (alerts.length > 0) {
         log(`Found ${alerts.length} new alert(s)!`);
-        await notify(alerts);
+        appendAlertLog(alerts);
+        log(`Saved to ${ALERTS_LOG}`);
+        const delivered = await notify(alerts);
+        if (delivered) {
+          for (const key of pendingKeys) state.add(key);
+          saveState(state);
+          log("State updated — won't re-alert these seats.");
+        } else {
+          log("Notification failed — will retry these seats next cycle.");
+        }
       } else {
         log("No new availability.");
       }
